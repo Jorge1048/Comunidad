@@ -1,95 +1,170 @@
+'use strict';
+
 const express = require('express');
-const cors = require('cors');
 const multer = require('multer');
-const { v4: uuidv4 } = require('uuid');
-const { spawn } = require('child_process');
+const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { PDFDocument } = require('pdf-lib');
+const FormData = require('form-data');
+const fetch = require('node-fetch');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-app.use(cors());
+const PORT = process.env.PORT || 3000;
+const STORAGE_TO_API = process.env.STORAGE_TO_API || 'https://storage.to/api';
 
-const UPLOAD_DIR = path.join(__dirname, 'temp_storage');
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+// CORS para el frontend
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+}));
 
-// Configuración de multer para guardar directo a disco y evitar picos de RAM
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const batchId = req.params.batchId || 'default';
-    const batchPath = path.join(UPLOAD_DIR, batchId);
-    if (!fs.existsSync(batchPath)) fs.mkdirSync(batchPath, { recursive: true });
-    cb(null, batchPath);
+app.use(express.json());
+
+// Configuración de multer: guardar en disco, no en memoria
+const upload = multer({
+  dest: os.tmpdir(),
+  limits: {
+    fileSize: 2 * 1024 * 1024 * 1024, // 2 GB por archivo
+    files: 200, // máximo 200 archivos por lote
   },
-  filename: (req, file, cb) => {
-    cb(null, file.originalname); // Mantenemos el nombre para el orden
-  }
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mpm-'));
+      req.uploadDir = dir;
+      cb(null, dir);
+    },
+    filename: (req, file, cb) => {
+      // Sanitizar nombre
+      const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+      cb(null, `${Date.now()}-${safe}`);
+    },
+  }),
 });
-const upload = multer({ storage });
 
-// Endpoint para subir y procesar
-app.post('/api/merge/:batchId', upload.array('pdfs'), (req, res) => {
-  const batchId = req.params.batchId;
-  const batchPath = path.join(UPLOAD_DIR, batchId);
-  const outputPath = path.join(UPLOAD_DIR, `${batchId}_final.pdf`);
+/**
+ * POST /merge
+ * Recibe múltiples PDFs, los fusiona y sube el resultado a storage.to.
+ * Devuelve { url, name, size }.
+ */
+app.post('/merge', upload.array('files', 200), async (req, res) => {
+  const uploadDir = req.uploadDir;
+  const files = req.files;
 
-  // Ordenar archivos exactamente como llegaron
-  const files = req.files.map(f => f.path);
-
-  if (files.length === 0) {
-    return res.status(400).json({ error: 'No se enviaron archivos' });
+  if (!files || files.length === 0) {
+    return res.status(400).json({ error: 'No se recibieron archivos' });
   }
 
-  // Usamos qpdf: qpdf --empty --pages file1 file2 ... -- output
-  // qpdf opera con streams de disco, consume ~30MB de RAM sin importar si el PDF pesa 3GB.
-  const args = ['--empty', '--pages', ...files, '--', outputPath];
-  const qpdf = spawn('qpdf', args);
+  const manga = req.body.manga || 'Manga';
+  const min = parseInt(req.body.min, 10) || 0;
+  const max = parseInt(req.body.max, 10) || 0;
+  const outputName = `(${min} - ${max}) ${manga}.pdf`;
 
-  qpdf.on('close', (code) => {
-    // Limpiar archivos originales para ahorrar espacio
-    files.forEach(f => {
-      try { fs.unlinkSync(f); } catch (e) {}
-    });
+  let mergedPath = null;
 
-    if (code !== 0) {
-      return res.status(500).json({ error: 'Error al unir los PDFs en el servidor.' });
+  try {
+    // 1. Fusionar con pdf-lib en modo secuencial (uno a uno)
+    const out = await PDFDocument.create();
+
+    for (const file of files) {
+      const filePath = file.path;
+      const fileBuffer = fs.readFileSync(filePath);
+      const src = await PDFDocument.load(fileBuffer, {
+        ignoreEncryption: true,
+        updateMetadata: false,
+      });
+      const pages = await out.copyPages(src, src.getPageIndices());
+      pages.forEach(p => out.addPage(p));
+      // El buffer se libera al final del bucle
     }
 
-    res.json({ 
-      success: true, 
-      downloadUrl: `/api/download/${batchId}` 
-    });
-  });
-});
+    // 2. Serializar a disco
+    mergedPath = path.join(uploadDir, 'merged.pdf');
+    const bytes = await out.save({ addDefaultPage: false });
+    fs.writeFileSync(mergedPath, bytes);
 
-// Endpoint para descargar
-app.get('/api/download/:batchId', (req, res) => {
-  const batchId = req.params.batchId;
-  const filePath = path.join(UPLOAD_DIR, `${batchId}_final.pdf`);
-  
-  if (fs.existsSync(filePath)) {
-    res.download(filePath, 'Manga_Batch.pdf');
-  } else {
-    res.status(404).send('El archivo ha expirado o no existe.');
+    const size = bytes.length;
+
+    // 3. Subir a storage.to
+    const fileStream = fs.createReadStream(mergedPath);
+    const form = new FormData();
+    form.append('file', fileStream, outputName);
+
+    // Iniciar subida (multipart automático si > 50 MB)
+    const initRes = await fetch(`${STORAGE_TO_API}/upload/init`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: outputName,
+        size: size,
+        type: 'application/pdf',
+      }),
+    });
+    if (!initRes.ok) throw new Error(`storage.to init falló: ${initRes.status}`);
+    const initData = await initRes.json();
+
+    // Subir usando la URL presignada
+    const uploadRes = await fetch(initData.uploadUrl, {
+      method: 'PUT',
+      body: fileStream,
+      headers: {
+        'Content-Type': 'application/pdf',
+        'Content-Length': String(size),
+      },
+    });
+    if (!uploadRes.ok) throw new Error(`storage.to upload falló: ${uploadRes.status}`);
+
+    // Confirmar subida
+    const confirmRes = await fetch(`${STORAGE_TO_API}/upload/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uploadId: initData.uploadId }),
+    });
+    if (!confirmRes.ok) throw new Error(`storage.to confirm falló: ${confirmRes.status}`);
+    const confirmData = await confirmRes.json();
+
+    // 4. Limpiar archivos temporales
+    fs.rmSync(uploadDir, { recursive: true, force: true });
+
+    res.json({
+      url: confirmData.url,
+      name: outputName,
+      size: size,
+    });
+  } catch (err) {
+    console.error('Error en /merge:', err);
+    // Limpiar temporales en caso de error
+    if (uploadDir && fs.existsSync(uploadDir)) {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+    }
+    res.status(500).json({ error: err.message || 'Error interno del servidor' });
   }
 });
 
-// Limpieza automática (Cron-like): Borra carpetas/archivos de más de 1 hora
-setInterval(() => {
-  const now = Date.now();
-  const ONE_HOUR = 60 * 60 * 1000;
-  fs.readdir(UPLOAD_DIR, (err, files) => {
-    if (err) return;
-    files.forEach(file => {
-      const filePath = path.join(UPLOAD_DIR, file);
-      fs.stat(filePath, (err, stats) => {
-        if (!err && (now - stats.mtimeMs > ONE_HOUR)) {
-          if (stats.isDirectory()) fs.rmSync(filePath, { recursive: true, force: true });
-          else fs.unlinkSync(filePath);
-        }
-      });
-    });
-  });
-}, 15 * 60 * 1000); // Revisa cada 15 min
+/**
+ * GET /health
+ */
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor Manga PDF en puerto ${PORT}`));
+// Limpieza automática de temporales cada 30 minutos
+setInterval(() => {
+  const tmp = os.tmpdir();
+  const dirs = fs.readdirSync(tmp).filter(d => d.startsWith('mpm-'));
+  const now = Date.now();
+  for (const dir of dirs) {
+    const full = path.join(tmp, dir);
+    try {
+      const stat = fs.statSync(full);
+      if (now - stat.mtimeMs > 60 * 60 * 1000) { // 1 hora
+        fs.rmSync(full, { recursive: true, force: true });
+      }
+    } catch (_) { /* ignorar */ }
+  }
+}, 30 * 60 * 1000);
+
+app.listen(PORT, () => {
+  console.log(`Manga PDF Manager backend escuchando en http://localhost:${PORT}`);
+});
