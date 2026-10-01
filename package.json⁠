@@ -1,15 +1,19 @@
 {
-  "name": "manga-pdf-backend",
+  "name": "manga-pdf-manager-backend",
   "version": "1.0.0",
-  "description": "Backend para concatenación de PDFs masivos",
+  "private": true,
+  "description": "Backend de fusión de PDFs para Manga PDF Manager",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.18.2",
+    "express": "^4.19.2",
+    "form-data": "^4.0.1",
     "multer": "^1.4.5-lts.1",
+    "node-fetch": "^2.7.0",
+    "pdf-lib": "^1.17.1",
     "uuid": "^9.0.1"
   }
 }
