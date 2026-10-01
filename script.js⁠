@@ -1,0 +1,481 @@
+// --- ESTADO GLOBAL DE LA APLICACIÓN ---
+const state = {
+    files: [], // Array de objetos File personalizados
+    mangaTitleFallback: "Manga",
+    totalSize: 0,
+    notifications: [],
+    batches: [],
+    isProcessing: false
+};
+
+// --- ELEMENTOS DOM ---
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const dashboard = document.getElementById('dashboard');
+const fileList = document.getElementById('file-list');
+const notificationsList = document.getElementById('notifications-list');
+const notificationsSection = document.getElementById('notifications-section');
+const processBtn = document.getElementById('process-btn');
+const clearBtn = document.getElementById('clear-btn');
+const maxSizeSelect = document.getElementById('max-size-select');
+
+// Modal Elements
+const downloadModal = document.getElementById('download-modal');
+const downloadFilenameInput = document.getElementById('download-filename-input');
+const confirmDownloadBtn = document.getElementById('confirm-download-btn');
+const skipDownloadBtn = document.getElementById('skip-download-btn');
+
+// --- EVENT LISTENERS INICIALES ---
+dropZone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropZone.classList.add('border-[#ff3355]', 'bg-[#161922]');
+});
+
+dropZone.addEventListener('dragleave', () => {
+    dropZone.classList.remove('border-[#ff3355]', 'bg-[#161922]');
+});
+
+dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('border-[#ff3355]', 'bg-[#161922]');
+    if (e.dataTransfer.files.length > 0) {
+        handleFilesSelected(Array.from(e.dataTransfer.files));
+    }
+});
+
+fileInput.addEventListener('change', (e) => {
+    if (e.target.files.length > 0) {
+        handleFilesSelected(Array.from(e.target.files));
+    }
+});
+
+clearBtn.addEventListener('click', () => {
+    state.files = [];
+    state.batches = [];
+    state.notifications = [];
+    render();
+    dashboard.classList.add('hidden');
+});
+
+// Inicializar SortableJS en la lista
+new Sortable(fileList, {
+    animation: 150,
+    handle: '.drag-handle',
+    onEnd: function () {
+        // Reordenar estado interno según el nuevo DOM
+        const newOrder = [];
+        const items = fileList.querySelectorAll('li');
+        items.forEach(item => {
+            const id = item.dataset.id;
+            const fileObj = state.files.find(f => f.id === id);
+            if (fileObj) newOrder.push(fileObj);
+        });
+        state.files = newOrder;
+        analyzeFiles(state.files);
+        updateStatsUI();
+    }
+});
+
+// --- MANEJO DE ARCHIVOS Y ANÁLISIS DE NOMBRES ---
+function handleFilesSelected(newRawFiles) {
+    const pdfFiles = newRawFiles.filter(f => f.name.toLowerCase().endsWith('.pdf'));
+    
+    if (pdfFiles.length === 0) {
+        alert("Por favor selecciona archivos en formato PDF.");
+        return;
+    }
+
+    const processedFiles = pdfFiles.map(file => {
+        const parsed = parseFilename(file.name);
+        return {
+            id: Math.random().toString(36).substring(2, 9),
+            file: file,
+            name: file.name,
+            size: file.size,
+            mangaName: parsed.mangaName,
+            start: parsed.start,
+            end: parsed.end,
+            isRecognized: parsed.isRecognized,
+            status: 'pending' // 'pending', 'ok', 'warning', 'processed', 'error'
+        };
+    });
+
+    state.files = [...state.files, ...processedFiles];
+    analyzeFiles(state.files);
+    render();
+    dashboard.classList.remove('hidden');
+}
+
+// --- PARSER MEJORADO Y FLEXIBLE ---
+function parseFilename(filename) {
+    const nameWithoutExt = filename.replace(/\.pdf$/i, '').trim();
+    let mangaName = '';
+    let start = null;
+    let end = null;
+    let isRecognized = false;
+
+    const normalized = nameWithoutExt.replace(/[_]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+    // 1. Rango estándar (ej: Naruto 01-17, Naruto Cap 01-17, Naruto [01-17], Naruto 01 al 17)
+    const rangeRegex = /^(.*?)\s*(?:cap(?:ítulo|itulo)?s?|chapter|chapters|ch|vol(?:umen)?|vol\.?)?\s*[\(\[]?\s*(\d+(?:\.\d+)?)\s*(?:-\vert{}–\vert{}—\vert{}al\vert{}a\vert{}to)\s*(\d+(?:\.\d+)?)\s*[\)\]]?\s*$/i;
+    let match = normalized.match(rangeRegex);
+
+    if (match) {
+        mangaName = match[1].trim();
+        start = parseFloat(match[2]);
+        end = parseFloat(match[3]);
+        isRecognized = true;
+    }
+
+    // 2. Capítulo individual (ej: Naruto 53, Naruto Cap 53)
+    if (!match) {
+        const singleRegex = /^(.*?)\s*(?:cap(?:ítulo|itulo)?s?|chapter|ch|vol(?:umen)?|vol\.?)?\s*[\(\[]?\s*(\d+(?:\.\d+)?)\s*[\)\]]?\s*$/i;
+        match = normalized.match(singleRegex);
+        if (match) {
+            mangaName = match[1].trim();
+            start = parseFloat(match[2]);
+            end = start;
+            isRecognized = true;
+        }
+    }
+
+    // 3. Número al principio (ej: 01-17 Naruto)
+    if (!match) {
+        const beginningRangeRegex = /^[\(\[]?\s*(\d+(?:\.\d+)?)\s*(?:-\vert{}–\vert{}—\vert{}al\vert{}a\vert{}to)\s*(\d+(?:\.\d+)?)\s*[\)\]]?\s*(.*?)$/i;         match = normalized.match(beginningRangeRegex);         if (match) {             start = parseFloat(match[1]);             end = parseFloat(match[2]);             mangaName = match[3].trim();             isRecognized = true;         }     }      mangaName = mangaName.replace(/[\(\)\[\]]/g, '').replace(/\s+/g, ' ').replace(/[-–—_:]+$/g, '').trim();
+
+    if (!mangaName) {
+        mangaName = "Manga";
+        isRecognized = false;
+    }
+
+    return { mangaName, start, end, isRecognized };
+}
+
+// --- ANÁLISIS INTELIGENTE Y DETECCIÓN DE ERRORES ---
+function analyzeFiles(filesToAnalyze) {
+    state.notifications = [];
+    state.mangaTitleFallback = "Manga";
+
+    if (filesToAnalyze.length === 0) return;
+
+    // Conteo de nombres dominantes
+    const nameCounts = {};
+    filesToAnalyze.forEach(file => {
+        if (file.isRecognized && file.mangaName && file.mangaName !== "Manga") {
+            const norm = file.mangaName.replace(/\s+/g, ' ').trim();
+            nameCounts[norm] = (nameCounts[norm] || 0) + 1;
+        }
+    });
+
+    let dominantName = "Manga";
+    let maxCount = 0;
+    Object.entries(nameCounts).forEach(([name, count]) => {
+        if (count > maxCount) {
+            maxCount = count;
+            dominantName = name;
+        }
+    });
+    state.mangaTitleFallback = dominantName;
+
+    // Ordenar numéricamente por capítulo inicial
+    filesToAnalyze.sort((a, b) => {
+        if (a.start === null && b.start === null) return 0;
+        if (a.start === null) return 1;
+        if (b.start === null) return -1;
+        return a.start - b.start;
+    });
+
+    const seenRanges = new Set();
+    filesToAnalyze.forEach((file, idx) => {
+        if (!file.isRecognized) {
+            state.notifications.push({
+                type: 'warning',
+                title: 'Formato no identificado',
+                text: `No se pudo determinar el rango de capítulos de "${file.name}".`
+            });
+            file.status = 'warning';
+            return;
+        }
+
+        // Advertencia si un archivo individual supera 2 GB
+        if (file.size > 2 * 1024 * 1024 * 1024) {
+            state.notifications.push({
+                type: 'error',
+                title: 'Archivo demasiado grande',
+                text: `"${file.name}" supera los 2 GB requeridos. Debe procesarse de manera independiente.`
+            });
+            file.status = 'error';
+        }
+
+        // Duplicados
+        const rangeKey = `${file.start}-${file.end}`;
+        if (seenRanges.has(rangeKey)) {
+            state.notifications.push({
+                type: 'warning',
+                title: 'Posible duplicado',
+                text: `Se encontraron dos archivos que contienen los capítulos ${rangeKey}.`
+            });
+            file.status = 'warning';
+        } else {
+            seenRanges.add(rangeKey);
+            if (file.status !== 'error') file.status = 'ok';
+        }
+
+        // Faltantes
+        if (idx > 0) {
+            const prev = filesToAnalyze[idx - 1];
+            if (prev.end !== null && file.start !== null && file.start > prev.end + 1) {
+                state.notifications.push({
+                    type: 'info',
+                    title: 'Posible capítulo faltante',
+                    text: `Se detectó un salto entre el capítulo ${prev.end} y el ${file.start}.`
+                });
+            }
+        }
+    });
+
+    calculateBatches();
+}
+
+// --- CÁLCULO DE LOTES (MÁXIMO 2 GB) ---
+function calculateBatches() {
+    state.batches = [];
+    const maxSizeBytes = parseInt(maxSizeSelect.value) * 1024 * 1024;
+    
+    let currentBatch = [];
+    let currentSize = 0;
+
+    state.files.forEach(fileObj => {
+        if (fileObj.status === 'error') return; // Omitir archivos corruptos o gigantes
+
+        if (currentSize + fileObj.size > maxSizeBytes && currentBatch.length > 0) {
+            state.batches.push(currentBatch);
+            currentBatch = [];
+            currentSize = 0;
+        }
+
+        currentBatch.push(fileObj);
+        currentSize += fileObj.size;
+    });
+
+    if (currentBatch.length > 0) {
+        state.batches.push(currentBatch);
+    }
+}
+
+// --- RENDERIZADO DE INTERFAZ ---
+function render() {
+    updateStatsUI();
+    renderNotifications();
+    renderFileList();
+}
+
+function updateStatsUI() {
+    document.getElementById('stat-files').textContent = state.files.length;
+    
+    const totalBytes = state.files.reduce((acc, f) => acc + f.size, 0);
+    document.getElementById('stat-size').textContent = formatBytes(totalBytes);
+    
+    document.getElementById('stat-manga').textContent = state.mangaTitleFallback;
+
+    const validStarts = state.files.map(f => f.start).filter(s => s !== null);
+    const validEnds = state.files.map(f => f.end).filter(e => e !== null);
+    
+    document.getElementById('stat-chapters').textContent = validStarts.length > 0 
+        ? `${Math.min(...validStarts)} - ${Math.max(...validEnds)}` 
+        : '-';
+
+    document.getElementById('stat-issues').textContent = state.notifications.length;
+    document.getElementById('stat-batches').textContent = state.batches.length;
+}
+
+function renderNotifications() {
+    notificationsList.innerHTML = '';
+    if (state.notifications.length === 0) {
+        notificationsSection.classList.add('hidden');
+        return;
+    }
+
+    notificationsSection.classList.remove('hidden');
+    state.notifications.forEach(notif => {
+        const div = document.createElement('div');
+        const bgColor = notif.type === 'error' ? 'bg-red-950/40 border-red-800 text-red-200' :
+                        notif.type === 'warning' ? 'bg-amber-950/40 border-amber-800 text-amber-200' :
+                        'bg-purple-950/40 border-purple-800 text-purple-200';
+        
+        div.className = `p-3 rounded-xl border text-xs flex items-start gap-2.5 ${bgColor}`;
+        div.innerHTML = `
+            <span class="text-base">${notif.type === 'error' ? '❌' : notif.type === 'warning' ? '⚠️' : '🔔'}</span>
+            <div>
+                <p class="font-bold">${notif.title}</p>
+                <p class="text-slate-300 mt-0.5">${notif.text}</p>
+            </div>
+        `;
+        notificationsList.appendChild(div);
+    });
+}
+
+function renderFileList() {
+    fileList.innerHTML = '';
+    
+    state.files.forEach(f => {
+        const li = document.createElement('li');
+        li.dataset.id = f.id;
+        li.className = `p-3 rounded-xl border bg-slate-900/80 border-slate-800/80 flex items-center justify-between gap-3 text-xs animate-fade-in`;
+
+        const badgeColor = f.status === 'processed' ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' :
+                           f.status === 'warning' ? 'bg-amber-500/20 text-amber-400 border-amber-500/30' :
+                           f.status === 'error' ? 'bg-red-500/20 text-red-400 border-red-500/30' :
+                           'bg-slate-800 text-slate-300 border-slate-700';
+
+        const statusLabel = f.status === 'processed' ? '✅ Procesado' :
+                            f.status === 'warning' ? '⚠️ Revisar' :
+                            f.status === 'error' ? '❌ Error' : '⏳ Pendiente';
+
+        const capText = f.isRecognized ? `Cap. ${f.start}${f.start !== f.end ? ` - ${f.end}` : ''}` : 'No detectado';
+
+        li.innerHTML = `
+            <div class="flex items-center gap-3 min-w-0">
+                <span class="drag-handle cursor-grab active:cursor-grabbing text-slate-500 hover:text-slate-300 text-base">☰</span>
+                <div class="min-w-0">
+                    <p class="font-semibold text-slate-200 truncate">${f.name}</p>
+                    <p class="text-[11px] text-slate-400 mt-0.5">${formatBytes(f.size)} • <span class="text-purple-400 font-medium">${capText}</span></p>
+                </div>
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+                <span class="px-2.5 py-1 rounded-lg border text-[10px] font-bold ${badgeColor}">${statusLabel}</span>
+            </div>
+        `;
+        fileList.appendChild(li);
+    });
+}
+
+// --- PROCESAMIENTO DE PDFs CON PDF-LIB ---
+processBtn.addEventListener('click', async () => {
+    if (state.batches.length === 0) {
+        alert("No hay lotes válidos para procesar.");
+        return;
+    }
+
+    state.isProcessing = true;
+    const progressContainer = document.getElementById('progress-container');
+    const progressBar = document.getElementById('progress-bar');
+    const progressStatusText = document.getElementById('progress-status-text');
+    const progressPercentage = document.getElementById('progress-percentage');
+    const progressDetail = document.getElementById('progress-detail');
+
+    progressContainer.classList.remove('hidden');
+    processBtn.disabled = true;
+    processBtn.classList.add('opacity-50', 'cursor-not-allowed');
+
+    for (let i = 0; i < state.batches.length; i++) {
+        const batch = state.batches[i];
+        
+        // Determinar min y max del lote
+        const validStarts = batch.map(f => f.start).filter(s => s !== null);
+        const validEnds = batch.map(f => f.end).filter(e => e !== null);
+        const minCap = validStarts.length > 0 ? Math.min(...validStarts) : 1;
+        const maxCap = validEnds.length > 0 ? Math.max(...validEnds) : batch.length;
+
+        const defaultFilename = `(${minCap} - ${maxCap}) ${state.mangaTitleFallback}`;
+
+        progressStatusText.textContent = `Procesando Lote ${i + 1} de ${state.batches.length}`;
+        progressDetail.textContent = `Uniendo ${batch.length} archivos para "${defaultFilename}.pdf"...`;
+
+        try {
+            const mergedPdfDoc = await PDFLib.PDFDocument.create();
+
+            for (let j = 0; j < batch.length; j++) {
+                const fileObj = batch[j];
+                const arrayBuffer = await fileObj.file.arrayBuffer();
+                const srcDoc = await PDFLib.PDFDocument.load(arrayBuffer);
+                const copiedPages = await mergedPdfDoc.copyPages(srcDoc, srcDoc.getPageIndices());
+                
+                copiedPages.forEach(page => mergedPdfDoc.addPage(page));
+
+                // Porcentaje de progreso incremental
+                const percent = Math.round(((j + 1) / batch.length) * 100);
+                progressBar.style.width = `${percent}%`;
+                progressPercentage.textContent = `${percent}%`;
+            }
+
+            const pdfBytes = await mergedPdfDoc.save();
+            const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+
+            // Marcar archivos como procesados
+            batch.forEach(f => f.status = 'processed');
+            render();
+
+            // Solicitar confirmación de descarga de forma interactiva
+            await promptForDownload(blob, defaultFilename);
+
+        } catch (err) {
+            console.error("Error al procesar lote:", err);
+            alert(`Ocurrió un error al procesar el lote ${i + 1}: ${err.message}`);
+        }
+    }
+
+    progressStatusText.textContent = "¡Todos los lotes procesados!";
+    progressDetail.textContent = "Proceso finalizado correctamente.";
+    progressBar.style.width = "100%";
+    progressPercentage.textContent = "100%";
+
+    state.isProcessing = false;
+    processBtn.disabled = false;
+    processBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+});
+
+// --- DESCARGA INTERACTIVA CON NOTIFICACIÓN DEL SISTEMA ---
+function promptForDownload(blob, defaultFilename) {
+    return new Promise((resolve) => {
+        downloadFilenameInput.value = defaultFilename;
+        downloadModal.classList.remove('hidden');
+
+        const handleConfirm = (e) => {
+            e.preventDefault(); // Evitar cualquier envío por defecto de formulario
+            
+            const cleanName = downloadFilenameInput.value.trim() || defaultFilename;
+            const finalFilename = cleanName.toLowerCase().endsWith('.pdf') ? cleanName : `${cleanName}.pdf`;
+
+            // Invocar la descarga mediante un blob nativo seguro
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = finalFilename;
+            document.body.appendChild(a);
+            a.click();
+
+            setTimeout(() => {
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            }, 1000);
+
+            cleanup();
+            resolve();
+        };
+
+        const handleSkip = (e) => {
+            e.preventDefault();
+            cleanup();
+            resolve();
+        };
+
+        function cleanup() {
+            downloadModal.classList.add('hidden');
+            confirmDownloadBtn.removeEventListener('click', handleConfirm);
+            skipDownloadBtn.removeEventListener('click', handleSkip);
+        }
+
+        confirmDownloadBtn.addEventListener('click', handleConfirm);
+        skipDownloadBtn.addEventListener('click', handleSkip);
+    });
+}
+
+// --- UTILIDAD DE FORMATO DE BYTES ---
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
