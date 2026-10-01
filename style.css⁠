@@ -1,0 +1,46 @@
+/* Custom Scrollbar dedicado para la lista de archivos */
+.custom-scroll-container {
+    max-height: 420px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #ff3355 #0c0e14;
+}
+
+/* Scrollbar en navegadores Webkit (Chrome, Edge, Safari) */
+.custom-scroll-container::-webkit-scrollbar {
+    width: 8px;
+}
+
+.custom-scroll-container::-webkit-scrollbar-track {
+    background: #0c0e14;
+    border-radius: 8px;
+}
+
+.custom-scroll-container::-webkit-scrollbar-thumb {
+    background: #ff3355;
+    border-radius: 8px;
+}
+
+.custom-scroll-container::-webkit-scrollbar-thumb:hover {
+    background: #8b5cf6;
+}
+
+/* Animaciones suaves */
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+    animation: fadeIn 0.25s ease-out forwards;
+}
+
+/* Estilos de arrastre con SortableJS */
+.sortable-ghost {
+    opacity: 0.3;
+    border: 2 border-dashed #ff3355 !important;
+}
+
+.sortable-drag {
+    cursor: grabbing;
+}
