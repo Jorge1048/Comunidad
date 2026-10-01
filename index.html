@@ -5,8 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Manga PDF Manager</title>
 <style>
-/* CSS idéntico al original para mantener tu interfaz exacta */
-:root{--bg:#0c0e14;--card:#161922;--in:#10121a;--line:#2a2d38;--tx:#ececf1;--mut:#9094a3;--red:#ff3355;--vio:#8b5cf6;--ok:#34d399;--warn:#f5b942;--blue:#3b82f6}
+:root{--bg:#0c0e14;--card:#161922;--in:#10121a;--line:#2a2d38;--tx:#ececf1;--mut:#9094a3;--red:#ff3355;--vio:#8b5cf6;--ok:#34d399;--warn:#f5b942}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.45 system-ui,Segoe UI,sans-serif}
 header{padding:22px 14px 6px;text-align:center}
@@ -40,17 +39,20 @@ li small{display:block;color:var(--mut)}
 li button{padding:6px 10px;font-size:.82rem}
 .bar{height:12px;background:var(--in);border-radius:6px;overflow:hidden;margin:8px 0}
 .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--red),var(--vio));transition:width .2s}
-.bar i.server{background:linear-gradient(90deg,var(--blue),var(--vio));}
 .alert{border-color:var(--warn);background:#2a2412}
 dialog{background:var(--card);color:var(--tx);border:1px solid var(--red);border-radius:14px;width:min(92vw,460px);padding:18px}
 dialog::backdrop{background:#000b}
 dialog .row button{flex:1}
+.upload-bar{height:8px;background:var(--in);border-radius:4px;overflow:hidden;margin:6px 0}
+.upload-bar i{display:block;height:100%;width:0;background:var(--vio);transition:width .3s}
+.link-box{background:var(--in);border-radius:10px;padding:12px;margin-top:8px;word-break:break-all;font-size:.9rem}
+.link-box a{color:var(--vio)}
 </style>
 </head>
 <body>
 <header>
   <h1>MANGA PDF MANAGER</h1>
-  <p>⚡ Híbrido: Local para lotes ligeros, nube segura para lotes pesados.</p>
+  <p id="privacy-note">🔒 Procesamiento local para lotes pequeños. Los lotes grandes se procesan en servidor temporal.</p>
 </header>
 <main>
   <div id="crash" class="card alert" hidden></div>
@@ -63,7 +65,12 @@ dialog .row button{flex:1}
     <div class="card"><div class="stats" id="stats"></div></div>
     <div class="card">
       <div class="row">
-        <label>Tamaño máximo por lote (Recomendado 2 GB)<select id="max"></select></label>
+        <label>Tamaño máximo por archivo<select id="max"></select></label>
+        <label>Umbral para servidor<select id="server-threshold">
+          <option value="300">300 MB (recomendado)</option>
+          <option value="500">500 MB</option>
+          <option value="1000">1 GB</option>
+        </select></label>
         <button id="auto" hidden>↕ Orden automático</button>
         <button id="clear">🗑️ Limpiar</button>
       </div>
@@ -84,32 +91,69 @@ dialog .row button{flex:1}
   <div class="row" style="margin-top:12px"><button id="skip">Omitir</button><button id="dl" class="primary">📥 Descargar PDF</button></div>
 </dialog>
 
+<dialog id="server-dlg">
+  <h3 style="margin:0 0 4px">🌐 Procesamiento en servidor</h3>
+  <p class="hint">Este lote supera el umbral local. Los archivos se subirán temporalmente a un servidor para fusionarlos. Se eliminarán automáticamente tras la descarga.</p>
+  <div id="server-progress"></div>
+  <div class="row" style="margin-top:12px"><button id="server-cancel">Cancelar</button><button id="server-ok" class="primary">📤 Subir y procesar</button></div>
+</dialog>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.2/Sortable.min.js"></script>
 <script>
 'use strict';
+/* Manga PDF Manager — procesamiento local + servidor para lotes grandes.
+   Los PDFs de lotes pequeños nunca salen del dispositivo.
+   Los PDFs de lotes grandes (> umbral) se suben temporalmente a un servidor
+   para fusionarlos y se eliminan automáticamente tras la descarga. */
+
 const $ = s => document.querySelector(s), MB = 1048576, GB = 1024 * MB;
-const S = { items: [], events: [], warn: [], manga: 'Manga', running: false, manual: false, doneBatches: [] };
+const API_BASE = 'http://localhost:3000'; // Cambiar en producción
+
+const S = {
+  items: [],
+  events: [],
+  warn: [],
+  manga: 'Manga',
+  running: false,
+  manual: false,
+  doneBatches: [],
+  serverBatches: [],
+};
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const fmt = b => b >= GB ? (b / GB).toFixed(2) + ' GB' : (b / MB).toFixed(0) + ' MB';
 const rng = (a, b) => a === b ? `${a}` : `${a}-${b}`;
-const tick = () => new Promise(r => setTimeout(r, 30)); 
-const ls = { get: k => { try { return localStorage.getItem(k); } catch (_) { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} }, del: k => { try { localStorage.removeItem(k); } catch (_) {} } };
-const doneSet = new Set(JSON.parse(ls.get('mpm_done') || '[]')); 
+const tick = () => new Promise(r => setTimeout(r, 30));
+const ls = {
+  get: k => { try { return localStorage.getItem(k); } catch (_) { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} },
+  del: k => { try { localStorage.removeItem(k); } catch (_) {} },
+};
+const doneSet = new Set(JSON.parse(ls.get('mpm_done') || '[]'));
 const keyOf = f => `${f.name}|${f.size}|${f.lastModified}`;
 
-// Configuración de Arquitectura Híbrida
-const SERVER_URL = 'http://localhost:3000'; // TODO: Cambia esto a la URL de tu backend
-const LOCAL_LIMIT = 200 * MB; // Si el lote pesa menos de 200MB, se procesa en RAM del móvil. Si es más, al servidor.
+const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const safeMB = Math.max(250, Math.min(2000, (navigator.deviceMemory || 4) * 1024 * (mobile ? .5 : 1) / 6));
 const SIZES = [250, 500, 1000, 1500, 2000];
 const sel = $('#max');
 sel.innerHTML = SIZES.map(v => `<option value="${v}">${v >= 1000 ? v / 1000 + ' GB' : v + ' MB'}</option>`).join('');
-sel.value = 2000; // Por defecto permitimos 2GB gracias al backend
+const pick = mb => SIZES.filter(v => v <= mb).pop() || 250;
+sel.value = pick(safeMB);
 const limit = () => +sel.value * MB;
 
 const crashed = ls.get('mpm_run');
-if (crashed) { ls.del('mpm_run'); $('#crash').hidden = false; $('#crash').innerHTML = `⚠️ Hubo un cierre abrupto anterior. Los lotes completados se han guardado.`; }
+if (crashed) {
+  ls.del('mpm_run');
+  try {
+    const r = JSON.parse(crashed), nuevo = pick(Math.min(+r.lim, r.mb) / 2);
+    sel.value = nuevo;
+    $('#crash').hidden = false;
+    $('#crash').innerHTML = `⚠️ La página se cerró al crear el lote ${r.n} (~${r.mb} MB), casi seguro por falta de memoria. Bajé el tamaño máximo a ${nuevo} MB.`;
+  } catch (_) {}
+}
 
+/* ---------- 1. Interpretar nombres ---------- */
 function parse(fn) {
   let s = fn.replace(/\.pdf$/i, '').replace(/_/g, ' '), copy = false;
   const c = s.match(/^(.*\S)\s+\((\d{1,2})\)\s*$/);
@@ -118,12 +162,14 @@ function parse(fn) {
   let m = s.match(/(\d+(?:\.\d+)?)\s*[-–—~]\s*(\d+(?:\.\d+)?)/), a, b;
   if (m) { a = +m[1]; b = +m[2]; }
   else {
-    m = s.match(/(\d+(?:\.\d+)?)(?=\)?\s*$)/); 
+    m = s.match(/(\d+(?:\.\d+)?)(?=\)?\s*$)/);
     if (!m || /\b(especial|special|extra|omake|oneshot)\b/i.test(s)) return bad;
     a = b = +m[1];
   }
   if (b < a) return bad;
-  const name = s.slice(0, m.index).replace(/\b(caps?|cap[ií]tulos?|chapters?|ch|vol(umen|umenes)?|tomo|c)\b\.?/gi, '').replace(/[()\[\]]/g, ' ').replace(/^[\s\-–—:]+|[\s\-–—:]+$/g, '').replace(/\s+/g, ' ');
+  const name = s.slice(0, m.index)
+    .replace(/\b(caps?|cap[ií]tulos?|chapters?|ch|vol(umen|umenes)?|tomo|c)\b\.?/gi, '')
+    .replace(/[()\[\]]/g, ' ').replace(/^[\s\-–—:]+|[\s\-–—:]+$/g, '').replace(/\s+/g, ' ');
   return { name, copy, start: a, end: b };
 }
 
@@ -132,15 +178,26 @@ function addFiles(list) {
     if (!/\.pdf$/i.test(f.name) && f.type !== 'application/pdf') continue;
     if (S.items.some(i => keyOf(i.file) === keyOf(f))) continue;
     const p = parse(f.name);
-    S.items.push({ file: f, size: f.size, ...p, parsed: p.start !== null, status: doneSet.has(keyOf(f)) ? 'done' : 'pending', keep: null, err: '' });
+    S.items.push({
+      file: f, size: f.size, ...p,
+      parsed: p.start !== null,
+      status: doneSet.has(keyOf(f)) ? 'done' : 'pending',
+      keep: null, err: '',
+    });
   }
-  $('#app').hidden = !S.items.length; render();
+  $('#app').hidden = !S.items.length;
+  render();
 }
 
+/* ---------- 2. Análisis ---------- */
 const active = i => i.parsed && !i.excluded && i.status !== 'error';
 function analyze() {
   const it = S.items, lim = limit();
-  if (!S.manual) it.sort((x, y) => (x.parsed === y.parsed ? 0 : x.parsed ? -1 : 1) || x.start - y.start || x.end - y.end || x.file.name.localeCompare(y.file.name, undefined, { numeric: true }));
+  if (!S.manual) it.sort((x, y) =>
+    (x.parsed === y.parsed ? 0 : x.parsed ? -1 : 1) ||
+    x.start - y.start || x.end - y.end ||
+    x.file.name.localeCompare(y.file.name, undefined, { numeric: true })
+  );
   const cnt = {};
   it.forEach(i => { if (i.name) { const k = i.name.toLowerCase(); (cnt[k] = cnt[k] || { n: 0, name: i.name }).n++; } });
   const top = Object.values(cnt).sort((a, b) => b.n - a.n)[0];
@@ -152,13 +209,26 @@ function analyze() {
     if (g.length < 2) continue;
     if (!g.some(i => i.keep)) { g.forEach(i => i.keep = false); [...g].sort((a, b) => a.copy - b.copy)[0].keep = true; }
     g.forEach(i => { i.dupKey = k; i.excluded = !i.keep; });
-    S.warn.push(`⚠️ Posible duplicado: caps ${k} (${g.length} arch).`);
+    S.warn.push(`⚠️ Posible duplicado: capítulos ${k} (${g.length} archivos).`);
   }
-  it.filter(i => !i.parsed).forEach(i => S.warn.push(`⚠️ No se pudo determinar el rango: ${i.file.name}`));
-  it.filter(i => i.size > lim && i.status !== 'done').forEach(i => S.warn.push(`⚠️ ${i.file.name} pesa ${fmt(i.size)} y supera el lote máximo.`));
+  it.filter(i => !i.parsed).forEach(i => S.warn.push(`⚠️ No se pudo determinar el rango de este archivo: ${i.file.name}`));
+  it.filter(i => i.size > lim && i.status !== 'done').forEach(i => S.warn.push(`⚠️ ${i.file.name} pesa ${fmt(i.size)} y supera el máximo.`));
   it.filter(i => i.status === 'error').forEach(i => S.warn.push(`❌ Error en ${i.file.name}: ${i.err}`));
+
+  S.missing = 0; let maxEnd = null;
+  [...it].filter(i => i.parsed && !i.excluded)
+    .sort((x, y) => x.start - y.start || x.end - y.end)
+    .forEach(i => {
+      if (maxEnd !== null && Math.ceil(i.start) - Math.floor(maxEnd) > 1) {
+        const a = Math.floor(maxEnd) + 1, b = Math.ceil(i.start) - 1;
+        S.missing += b - a + 1;
+        S.warn.push(`⚠️ Posible capítulo faltante: ${rng(a, b)}.`);
+      }
+      maxEnd = maxEnd === null ? i.end : Math.max(maxEnd, i.end);
+    });
 }
 
+/* ---------- 3. Lotes ---------- */
 function batches() {
   const lim = limit(), out = []; let cur = null;
   for (const f of S.items.filter(i => active(i) && i.status === 'pending' && i.size <= lim)) {
@@ -169,126 +239,229 @@ function batches() {
   return out;
 }
 
+/* ---------- 4. Pantalla ---------- */
 function render() {
   analyze();
   const it = S.items, sum = fn => it.filter(fn).reduce((n, i) => n + i.size, 0), bs = batches();
   const ps = it.filter(i => i.parsed), errs = it.filter(i => i.status === 'error').length;
-  const st = [['📚 Manga', S.manga], ['📄 Archivos', it.length], ['💾 Tamaño', fmt(sum(() => true))], ['✅ Listos', fmt(sum(i => i.status === 'done'))], ['⏳ Pendientes', bs.length]];
+  const st = [
+    ['📚 Manga', S.manga],
+    ['📄 Archivos', it.length],
+    ['📖 Capítulos', ps.length ? rng(Math.min(...ps.map(i => i.start)), Math.max(...ps.map(i => i.end))) : '—'],
+    ['💾 Tamaño total', fmt(sum(() => true))],
+    ['✅ Procesados', fmt(sum(i => i.status === 'done'))],
+    ['⏳ Pendientes', fmt(bs.reduce((n, b) => n + b.size, 0))],
+    ['⚠️ Advertencias', S.warn.length - errs],
+    ['❌ Errores', errs],
+    ['Faltantes', S.missing],
+    ['Lotes pendientes', bs.length],
+  ];
   $('#stats').innerHTML = st.map(([k, v]) => `<div><span>${k}</span><b>${esc(v)}</b></div>`).join('');
+
   const ev = [...S.warn.map(t => ({ t })), ...S.events.map(e => ({ t: `${e.i} ${e.t}`, time: e.time }))];
-  $('#notes').innerHTML = ev.map(e => `<li class="${e.t.startsWith('❌') ? 'error' : e.t.startsWith('⚠️') ? 'warn' : 'done'}"><span class="info">${esc(e.t)}</span><small>${e.time || ''}</small></li>`).join('') || '<li>Sin notificaciones.</li>';
-  $('#batches').innerHTML = S.doneBatches.map(d => `<li class="done"><span class="info"><b>✅ ${esc(d.name)}</b><small>Capítulos ${d.r}</small></span></li>`).join('') +
-    bs.map((b, n) => `<li class="pending"><span class="info"><b>⏳ Lote ${n + 1} ${b.size > LOCAL_LIMIT ? '☁️ (Nube)' : '📱 (Local)'}</b><small>Caps ${rng(b.min, b.max)} · ${fmt(b.size)}</small></span></li>`).join('') || '<li>No hay lotes.</li>';
+  $('#notes').innerHTML = ev.map(e =>
+    `<li class="${e.t.startsWith('❌') ? 'error' : e.t.startsWith('⚠️') ? 'warn' : 'done'}"><span class="info">${esc(e.t)}</span><small>${e.time || ''}</small></li>`
+  ).join('') || '<li>Sin notificaciones.</li>';
+
+  $('#batches').innerHTML = S.doneBatches.map(d =>
+    `<li class="done"><span class="info"><b>✅ ${esc(d.name)}</b><small>Capítulos ${d.r} · ${fmt(d.size)}</small></span></li>`
+  ).join('') + S.serverBatches.map(d =>
+    `<li class="done"><span class="info"><b>🌐 ${esc(d.name)}</b><small>Capítulos ${d.r} · ${fmt(d.size)} · <a href="${d.url}" target="_blank" rel="noopener">Descargar</a></small></span></li>`
+  ).join('') + bs.map((b, n) => {
+    const needsServer = b.size > (+$('#server-threshold').value * MB);
+    return `<li class="${needsServer ? 'warn' : 'pending'}"><span class="info"><b>${needsServer ? '🌐' : '⏳'} Lote ${n + 1}</b><small>Capítulos ${rng(b.min, b.max)} · ${fmt(b.size)} · ${b.files.length} archivos${needsServer ? ' · requiere servidor' : ''}</small></span></li>`;
+  }).join('') || '<li>No hay lotes pendientes.</li>';
+
   $('#files').innerHTML = it.map((i, n) => {
-    const cls = i.status === 'done' ? 'done' : i.status === 'error' ? 'error' : (!i.parsed || i.dupKey || i.size > limit()) ? 'warn' : 'pending';
-    return `<li data-n="${n}" class="${cls} ${i.excluded ? 'off' : ''}"><span class="info"><b>${{ done: '✅', error: '❌', warn: '⚠️', pending: '⏳' }[cls]} ${esc(i.file.name)}</b><small>${fmt(i.size)}</small></span>
-      <span>${!i.parsed ? `<button data-a="set">Asignar</button> ` : ''}${i.dupKey && !i.keep ? `<button data-a="keep">Conservar</button> ` : ''}<button data-a="rm" aria-label="Quitar">✕</button></span></li>`;
+    const big = i.size > limit() && i.status !== 'done';
+    const cls = i.status === 'done' ? 'done' : i.status === 'error' ? 'error' :
+      (!i.parsed || i.dupKey || big) ? 'warn' : 'pending';
+    const tx = i.status === 'done' ? 'Procesado' : i.status === 'error' ? 'Error: ' + i.err :
+      !i.parsed ? 'Rango no reconocido' : i.excluded ? 'Duplicado omitido' :
+      i.dupKey ? 'Duplicado (conservado)' : big ? 'Demasiado grande' : 'Pendiente';
+    return `<li data-n="${n}" class="${cls} ${i.excluded ? 'off' : ''}">
+      <span class="info"><b>${{ done: '✅', error: '❌', warn: '⚠️', pending: '⏳' }[cls]} ${esc(i.file.name)}</b>
+      <small>${fmt(i.size)} · Cap. ${i.parsed ? rng(i.start, i.end) : '?'} · ${esc(tx)}</small></span>
+      <span>${!i.parsed ? `<button data-a="set">Asignar capítulos</button> ` : ''}${i.dupKey && !i.keep ? `<button data-a="keep">Conservar este</button> ` : ''}<button data-a="rm" aria-label="Quitar">✕</button></span></li>`;
   }).join('');
-  $('#memHint').innerHTML = `💡 Los lotes pequeños (< 200 MB) se procesan en tu móvil. Los lotes pesados se procesan en la nube para no cerrar la aplicación por falta de memoria.`;
-  $('#auto').hidden = !S.manual; $('#go').disabled = S.running || !bs.length;
+
+  $('#memHint').innerHTML = (+sel.value > safeMB ? '⚠️ ' : '💡 ') +
+    `Tamaño seguro estimado para este equipo: ~${Math.round(safeMB)} MB. ` +
+    `Los lotes que superen ${$('#server-threshold').value} MB se procesarán en servidor.`;
+  $('#auto').hidden = !S.manual;
+  $('#go').disabled = S.running || !bs.length;
 }
 const note = (i, t) => { S.events.unshift({ i, t, time: new Date().toLocaleTimeString() }); render(); };
 
-function askName(def) {
+/* ---------- 5. Nombre y guardado local ---------- */
+function askName(def, size) {
   return new Promise(res => {
-    const d = $('#dlg'); $('#nm').value = def; $('#dinfo').textContent = `Revisa el nombre del archivo final.`;
+    const d = $('#dlg');
+    $('#nm').value = def;
+    $('#dinfo').textContent = `Tamaño: ${fmt(size)}. Edita el nombre si quieres.`;
     const done = v => { d.close(); res(v); };
-    $('#dl').onclick = () => done(($('#nm').value.trim() \vert{}\vert{} def).replace(/[\\/:*?"<>\vert{}]/g, '').replace(/\.pdf$/i, ''));
+    $('#dl').onclick = () => done(($('#nm').value.trim() || def).replace(/[\\/:*?"<>|]/g, '').replace(/\.pdf$/i, ''));
     $('#skip').onclick = () => done(null);
-    d.oncancel = e => e.preventDefault(); d.showModal();
+    d.oncancel = e => e.preventDefault();
+    d.showModal();
   });
 }
-
-async function saveFileLocal(bytes, name) {
+async function saveFile(bytes, name) {
   const fileName = name + '.pdf';
+  if (window.showSaveFilePicker) {
+    try {
+      const h = await showSaveFilePicker({ suggestedName: fileName, types: [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }] });
+      const w = await h.createWritable();
+      for (let o = 0; o < bytes.length; o += 32 * MB) await w.write(bytes.subarray(o, o + 32 * MB));
+      await w.close(); return true;
+    } catch (e) { if (e.name === 'AbortError') return false; console.warn(e); }
+  }
   const blob = new Blob([bytes], { type: 'application/pdf' });
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName;
-  document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 300000);
+  const file = new File([blob], fileName, { type: 'application/pdf' });
+  if (/iPhone|iPad|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file] }); return true; }
+      catch (e) { if (e.name === 'AbortError') return false; }
+    }
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = fileName;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 300000);
   return true;
 }
 
-function processServer(b, n, total) {
-  return new Promise((resolve, reject) => {
-    const batchId = 'batch_' + Date.now() + '_' + Math.floor(Math.random()*1000);
-    const fd = new FormData();
-    b.files.forEach(f => fd.append('pdfs', f.file, f.file.name));
+/* ---------- 6. Subida al servidor ---------- */
+async function uploadToServer(batch, onProgress) {
+  const form = new FormData();
+  batch.files.forEach((f, i) => {
+    form.append('files', f.file, f.file.name);
+  });
+  form.append('manga', S.manga);
+  form.append('min', String(batch.min));
+  form.append('max', String(batch.max));
 
+  return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `${SERVER_URL}/api/merge/${batchId}`, true);
-    
+    xhr.open('POST', `${API_BASE}/merge`);
     xhr.upload.onprogress = e => {
-      if (e.lengthComputable) {
-        const pct = Math.round((e.loaded / e.total) * 100);
-        $('#prog').innerHTML = `<h2>Lote ${n + 1} de ${total} (Nube)</h2><div>Subiendo archivos pesados...</div><div class="bar"><i class="server" style="width:${pct}%"></i></div><small class="hint">${pct}% de ${fmt(e.total)}</small>`;
-      }
+      if (e.lengthComputable) onProgress(e.loaded / e.total);
     };
-    
     xhr.onload = () => {
-      if (xhr.status === 200) {
-        const res = JSON.parse(xhr.responseText);
-        resolve(`${SERVER_URL}${res.downloadUrl}`);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch (err) { reject(new Error('Respuesta inválida del servidor')); }
       } else {
-        reject(new Error('El servidor rechazó la solicitud. Revisa la conexión.'));
+        reject(new Error(`Error del servidor: ${xhr.status} ${xhr.statusText}`));
       }
     };
-    xhr.onerror = () => reject(new Error('Error de red al conectar con el servidor.'));
-    xhr.send(fd);
-    $('#prog').innerHTML = `<h2>Lote ${n + 1} de ${total} (Nube)</h2><div>Iniciando subida...</div><div class="bar"><i class="server" style="width:5%"></i></div>`;
+    xhr.onerror = () => reject(new Error('Error de red al subir al servidor'));
+    xhr.ontimeout = () => reject(new Error('Tiempo de espera agotado'));
+    xhr.timeout = 600000; // 10 minutos
+    xhr.send(form);
   });
 }
 
-async function processLocal(b, n, total) {
-  let out = await PDFLib.PDFDocument.create(), read = 0;
-  for (const f of b.files) {
-    const pct = Math.round(read / b.size * 100);
-    $('#prog').innerHTML = `<h2>Procesando lote ${n + 1} de ${total} (Local)</h2><div class="bar"><i style="width:${pct}%"></i></div><small class="hint">${pct}% · ${esc(f.file.name)}</small>`;
-    await tick();
-    let buf = await f.file.arrayBuffer(), src = await PDFLib.PDFDocument.load(buf, { ignoreEncryption: true, updateMetadata: false });
-    (await out.copyPages(src, src.getPageIndices())).forEach(p => out.addPage(p));
-    buf = src = null; read += f.size;
-  }
-  $('#prog').innerHTML = `<h2>Lote ${n + 1} de ${total}: Construyendo PDF…</h2><div class="bar"><i style="width:100%"></i></div>`;
-  await tick();
-  let bytes = await out.save({ addDefaultPage: false }); out = null;
-  return bytes;
+function askServer(batch, onProgress) {
+  return new Promise((resolve, reject) => {
+    const d = $('#server-dlg');
+    const prog = $('#server-progress');
+    prog.innerHTML = '';
+    const cancel = () => { d.close(); reject(new Error('Cancelado por el usuario')); };
+    $('#server-cancel').onclick = cancel;
+    $('#server-ok').onclick = async () => {
+      $('#server-ok').disabled = true;
+      prog.innerHTML = '<div class="upload-bar"><i style="width:0%"></i></div><p class="hint">Subiendo archivos al servidor…</p>';
+      try {
+        const result = await uploadToServer(batch, pct => {
+          prog.querySelector('i').style.width = Math.round(pct * 100) + '%';
+        });
+        d.close();
+        resolve(result);
+      } catch (e) {
+        $('#server-ok').disabled = false;
+        prog.innerHTML = `<p class="hint" style="color:var(--red)">Error: ${esc(e.message)}</p>`;
+      }
+    };
+    d.oncancel = e => e.preventDefault();
+    d.showModal();
+  });
 }
 
+/* ---------- 7. Procesar lotes ---------- */
 async function run() {
   if (S.running) return;
+  if (typeof PDFLib === 'undefined') return note('❌', 'No se cargó la librería pdf-lib. Recarga la página.');
   const bs = batches(); if (!bs.length) return;
   S.running = true; render(); $('#prog').hidden = false;
   let wl = null, aborted = false;
   try { wl = await navigator.wakeLock?.request('screen'); } catch (_) {}
-  
+
   for (let n = 0; n < bs.length && !aborted; n++) {
     const b = bs[n];
-    try {
-      ls.set('mpm_run', JSON.stringify({ n: n + 1, mb: Math.round(b.size / MB) }));
-      const isCloud = b.size > LOCAL_LIMIT;
-      let url = null, bytes = null;
-      
-      const suggestedName = `(${b.min} - ${b.max}) ${S.manga}`;
-      const name = await askName(suggestedName);
-      if (!name) { note('⚠️', `Lote ${n + 1} omitido.`); continue; }
+    const threshold = +$('#server-threshold').value * MB;
 
-      if (isCloud) {
-        url = await processServer(b, n, bs.length);
-        // Descarga vía Server
-        const a = document.createElement('a'); a.href = url; a.download = name + '.pdf';
-        a.target = '_blank'; document.body.append(a); a.click(); a.remove();
-      } else {
-        bytes = await processLocal(b, n, bs.length);
-        await saveFileLocal(bytes, name);
-        bytes = null;
+    /* --- Lote grande: servidor --- */
+    if (b.size > threshold) {
+      try {
+        $('#prog').innerHTML = `<h2>Lote ${n + 1} de ${bs.length} (servidor)</h2><p class="hint">Subiendo ${b.files.length} archivos (${fmt(b.size)})…</p>`;
+        const result = await askServer(b, () => {});
+        b.files.forEach(f => { f.status = 'done'; doneSet.add(keyOf(f.file)); });
+        ls.set('mpm_done', JSON.stringify([...doneSet]));
+        S.serverBatches.push({
+          name: result.name || `${rng(b.min, b.max)} ${S.manga}.pdf`,
+          r: rng(b.min, b.max),
+          size: result.size || b.size,
+          url: result.url,
+        });
+        note('🔔', `Lote ${n + 1} creado en servidor: <a href="${result.url}" target="_blank">${esc(result.url)}</a>`);
+      } catch (e) {
+        note('❌', `Lote ${n + 1} (servidor) falló: ${e.message}`);
+        if (e.message === 'Cancelado por el usuario') aborted = true;
       }
-      
-      b.files.forEach(f => { f.status = 'done'; doneSet.add(keyOf(f.file)); });
-      ls.set('mpm_done', JSON.stringify([...doneSet]));
-      S.doneBatches.push({ name: name + '.pdf', r: rng(b.min, b.max) });
-      note('🔔', `Lote terminado: ${name}`);
+      continue;
+    }
 
+    /* --- Lote pequeño: local --- */
+    let cur = null;
+    try {
+      ls.set('mpm_run', JSON.stringify({ n: n + 1, mb: Math.round(b.size / MB), lim: +sel.value }));
+      let out = await PDFLib.PDFDocument.create(), read = 0;
+      for (const f of b.files) {
+        cur = f;
+        const pct = Math.round(read / b.size * 100);
+        $('#prog').innerHTML = `<h2>Procesando lote ${n + 1} de ${bs.length}</h2>
+          <div>${esc(S.manga)} ${rng(b.min, b.max)}</div>
+          <div class="bar"><i style="width:${pct}%"></i></div>
+          <small class="hint">${pct}% · ${esc(f.file.name)}</small>`;
+        await tick();
+        let buf = await f.file.arrayBuffer();
+        let src = await PDFLib.PDFDocument.load(buf, { ignoreEncryption: true, updateMetadata: false });
+        (await out.copyPages(src, src.getPageIndices())).forEach(p => out.addPage(p));
+        buf = src = null; read += f.size;
+      }
+      cur = null;
+      $('#prog').innerHTML = `<h2>Lote ${n + 1} de ${bs.length}: guardando…</h2><div class="bar"><i style="width:100%"></i></div>`;
+      await tick();
+      let bytes = await out.save({ addDefaultPage: false }); out = null;
+      if (!bytes.length) throw new Error('el PDF generado está vacío');
+      const size = bytes.length;
+      const name = await askName(`(${b.min} - ${b.max}) ${S.manga}`, size);
+      const ok = name ? await saveFile(bytes, name) : false;
+      bytes = null;
+      if (!name) note('⚠️', `Lote ${n + 1} omitido: sigue pendiente.`);
+      else if (!ok) { ab[orted =1 true; note('⚠️', 'Descarga cancelada: el lote sigue pend]);iente.'); }
+      else {
+        b.files.forEach(f => i { f.status = 'done'; doneSet.add(keyOf(f.file));. });
+        ls.set('mpm_done', JSON.stringify([...doneparsedSet]));
+        S.doneB =atches.push({ name: name + '.pdf', r: rng(b true.min, b.max), size });
+        note(';🔔', `Lote terminado: se creó correctamente }
+ ${name}.pdf`);
+      }
     } catch (e) {
-      note('❌', `Lote ${n + 1} falló: ${e.message}`);
+       if (cur) { cur.status = 'error'; cur.err = e.message || 'no se pudo leer'; }
+      note('❌', `Lote ${n + 1} falló${cur ? ' en ' + cur.file.name : ''}: ${e.message}`);
     } finally { ls.del('mpm_run'); }
   }
   S.running = false; $('#prog').hidden = true;
@@ -296,25 +469,44 @@ async function run() {
   if (!aborted) note('🔔', 'Proceso terminado.');
 }
 
+/* ---------- 8. Eventos ---------- */
 $('#file').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
 const drop = $('#drop');
 ['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
 ['dragleave', 'drop'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('over'); }));
 drop.addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
-sel.onchange = render; $('#go').onclick = run; $('#auto').onclick = () => { S.manual = false; render(); };
-$('#clear').onclick = () => { if (!confirm('¿Limpiar historial?')) return; Object.assign(S, { items: [], events: [], doneBatches: [], manual: false }); doneSet.clear(); ls.del('mpm_done'); render(); };
+sel.onchange = render;
+$('#server-threshold').onchange = render;
+$('#go').onclick = run;
+$('#auto').onclick = () => { S.manual = false; render(); };
+$('#clear').onclick = () => {
+  if (S.running || !confirm('¿Limpiar la lista y olvidar los archivos ya procesados?')) return;
+  Object.assign(S, { items: [], events: [], doneBatches: [], serverBatches: [], manual: false });
+  doneSet.clear(); ls.del('mpm_done');
+  $('#app').hidden = true; render();
+};
 $('#files').onclick = e => {
   const b = e.target.closest('button'); if (!b || S.running) return;
   const n = +b.closest('li').dataset.n, i = S.items[n];
   if (b.dataset.a === 'rm') S.items.splice(n, 1);
   if (b.dataset.a === 'keep') S.items.filter(x => x.dupKey === i.dupKey).forEach(x => x.keep = x === i);
   if (b.dataset.a === 'set') {
-    const m = (prompt(`Caps (ej: 12-20):`) || '').match(/^\s*(\d+(?:\.\d+)?)\s*(?:[-–]\s*(\d+(?:\.\d+)?))?\s*$/);
-    if (m && (!m[2] || +m[2] >= +m[1])) { i.start = +m[1]; i.end = +(m[2] || m[1]); i.parsed = true; }
-  }
-  render();
+    const m = (prompt(`Capítulos de "${i.file.name}" (ej: 12 o 12-20):`) || '')
+      .match(/^\s*(\d+(?:\.\d+)?)\s*(?:[-–]\s*(\d+(?:\.\d+)?))?\s*$/);
+    if (m && (!m[2] || +m[2] >= +m[1])) { i.start = +m[1]; i.end = +(m[2] || m }
+  $('#app').hidden = !S.items.length; render();
 };
-if (window.Sortable) new Sortable($('#files'), { animation: 150, delay: 250, delayOnTouchOnly: true, filter: 'button', onEnd() { S.items = [...$('#files').children].map(li => S.items[+li.dataset.n]); S.manual = true; render(); }});
+if (window.Sortable) new Sortable($('#files'), {
+  animation: 150, delay: 250, delayOnTouchOnly: true, touchStartThreshold: 6,
+  filter: 'button', preventOnFilter: false,
+  onEnd() {
+    if (S.running) return render();
+    S.items = [...$('#files').children].map(li => S.items[+li.dataset.n]);
+    S.manual = true; render();
+  },
+});
+addEventListener('error', e => note('❌', `Error de JavaScript: ${e.message}`));
+addEventListener('unhandledrejection', e => note('❌', `Error: ${(e.reason && e.reason.message) || e.reason}`));
 render();
 </script>
 </body>
