@@ -1,108 +1,445 @@
-'use strict';
-/* Manga PDF Manager — servidor de unión. Solo módulos de Node; requiere el binario `qpdf`. */
-const http = require('http'), fs = require('fs'), fsp = fs.promises, path = require('path'), crypto = require('crypto');
-const { spawn } = require('child_process'), { pipeline } = require('stream/promises');
-const PORT = +process.env.PORT || 8080, DATA = process.env.DATA_DIR || './data',
-  TTL = (+process.env.TTL_HOURS || 6) * 36e5, MAX_JOB = (+process.env.MAX_JOB_GB || 8) * 2 ** 30,
-  MAX_JOBS = +process.env.MAX_JOBS || 20, ORIGIN = process.env.ALLOWED_ORIGIN || '*';
-fs.mkdirSync(DATA, { recursive: true });
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Manga PDF Manager</title>
+<style>
+:root{--bg:#0c0e14;--card:#161922;--in:#10121a;--line:#2a2d38;--tx:#ececf1;--mut:#9094a3;--red:#ff3355;--vio:#8b5cf6;--ok:#34d399;--warn:#f5b942}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.45 system-ui,Segoe UI,sans-serif}
+header{padding:22px 14px 6px;text-align:center}
+h1{margin:0;font:900 clamp(1.7rem,7vw,2.8rem) Impact,"Arial Black",sans-serif;letter-spacing:.04em;background:linear-gradient(90deg,#fff,var(--red) 60%,var(--vio));-webkit-background-clip:text;background-clip:text;color:transparent}
+header p{margin:.4rem 0 0;color:var(--mut);font-size:.85rem}
+main,#app{display:grid;gap:14px}
+main{max-width:920px;margin:auto;padding:12px 14px 70px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+.card h2{margin:0 0 8px;font-size:1.02rem}
+.drop{display:grid;place-items:center;gap:4px;min-height:150px;text-align:center;cursor:pointer;border:2px dashed var(--line);font-size:1.15rem}
+.drop:hover,.drop.over{border-color:var(--red)}
+.drop small,.hint{color:var(--mut);font-size:.85rem}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+.stats div{background:var(--in);border-radius:10px;padding:9px 11px}
+.stats span{display:block;color:var(--mut);font-size:.75rem}
+.stats b{font-size:1rem;word-break:break-word}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:end}
+.row label{flex:1 1 220px;color:var(--mut);font-size:.88rem}
+select,input{width:100%;background:var(--in);color:var(--tx);border:1px solid var(--line);border-radius:10px;padding:10px;font:inherit}
+button{background:#262935;color:var(--tx);border:0;border-radius:10px;padding:10px 14px;font:inherit;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
+.primary{background:linear-gradient(90deg,var(--red),var(--vio));font-weight:700}
+.wide{width:100%;padding:14px;font-size:1.05rem}
+ul{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+li{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;background:var(--in);border-radius:10px;padding:10px;border-left:4px solid var(--line)}
+li.pending{border-color:var(--mut)}li.done{border-color:var(--ok)}li.warn{border-color:var(--warn)}li.error{border-color:var(--red)}li.off{opacity:.5}
+#files li{cursor:grab;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+#files .sortable-ghost{opacity:.35;outline:2px dashed var(--red)}
+li .info{flex:1 1 220px;min-width:0;word-break:break-word}
+li small{display:block;color:var(--mut)}
+li button{padding:6px 10px;font-size:.82rem}
+.bar{height:12px;background:var(--in);border-radius:6px;overflow:hidden;margin:8px 0}
+.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--red),var(--vio));transition:width .2s}
+.alert{border-color:var(--warn);background:#2a2412}
+dialog{background:var(--card);color:var(--tx);border:1px solid var(--red);border-radius:14px;width:min(92vw,460px);padding:18px}
+dialog::backdrop{background:#000b}
+dialog .row button{flex:1}
+</style>
+</head>
+<body>
+<header>
+  <h1>MANGA PDF MANAGER</h1>
+  <p id="priv">🔒 100% local: tus PDFs nunca salen de este dispositivo</p>
+</header>
+<main>
+  <div id="crash" class="card alert" hidden></div>
+  <label id="drop" class="card drop">
+    <input id="file" type="file" accept="application/pdf,.pdf" multiple hidden>
+    <b>📂 Seleccionar archivos PDF</b><small>o arrástralos hasta aquí</small>
+  </label>
 
-const dir = id => path.join(DATA, id), jf = id => path.join(dir(id), 'job.json');
-const read = async id => JSON.parse(await fsp.readFile(jf(id), 'utf8'));
-const write = (id, o) => fsp.writeFile(jf(id), JSON.stringify(o));
-const json = (res, code, o) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
-const body = req => new Promise((ok, ko) => { let s = ''; req.on('data', d => { s += d; if (s.length > 1e5) ko(new Error('cuerpo demasiado grande')); }); req.on('end', () => ok(s)); req.on('error', ko); });
-async function uploaded(id) { // archivos completos: { índice: bytes }
-  const out = {};
-  for (const f of await fsp.readdir(dir(id))) { const m = f.match(/^(\d+)\.pdf$/); if (m) out[+m[1]] = (await fsp.stat(path.join(dir(id), f))).size; }
-  return out;
+  <section id="app" hidden>
+    <div class="card"><div class="stats" id="stats"></div></div>
+    <div class="card">
+      <div class="row">
+        <label>Tamaño máximo por archivo<select id="max"></select></label>
+        <label id="modeL" hidden>Procesamiento<select id="mode"><option value="auto">Automático (lotes grandes en servidor)</option><option value="local">Solo en este dispositivo</option><option value="server">Siempre en servidor</option></select></label>
+        <button id="auto" hidden>↕ Orden automático</button>
+        <button id="clear">🗑️ Limpiar</button>
+      </div>
+      <p class="hint" id="memHint"></p>
+      <button id="go" class="primary wide">📚 CREAR PDFs</button>
+    </div>
+    <div class="card" id="prog" hidden></div>
+    <div class="card"><h2>🔔 Notificaciones</h2><ul id="notes"></ul></div>
+    <div class="card"><h2>Lotes</h2><ul id="batches"></ul></div>
+    <div class="card"><h2>Archivos</h2><p class="hint">Mantén presionado un archivo y arrástralo para cambiar su posición.</p><ul id="files"></ul></div>
+  </section>
+</main>
+
+<dialog id="dlg">
+  <h3 style="margin:0 0 4px">✅ Lote listo</h3>
+  <p class="hint" id="dinfo"></p>
+  <input id="nm" aria-label="Nombre del archivo">
+  <div class="row" style="margin-top:12px"><button id="skip">Omitir</button><button id="dl" class="primary">📥 Descargar PDF</button></div>
+</dialog>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.2/Sortable.min.js"></script>
+<script>
+'use strict';
+/* Manga PDF Manager — todo ocurre en el navegador; los PDFs no se suben a ningún sitio. */
+const $ = s => document.querySelector(s), MB = 1048576, GB = 1024 * MB;
+const S = { items: [], events: [], warn: [], manga: 'Manga', running: false, manual: false, doneBatches: [] };
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const fmt = b => b >= GB ? (b / GB).toFixed(2) + ' GB' : (b / MB).toFixed(0) + ' MB';
+const rng = (a, b) => a === b ? `${a}` : `${a}-${b}`;
+const tick = () => new Promise(r => setTimeout(r, 30)); // cede el hilo: deja respirar al recolector de memoria
+const ls = { // localStorage a prueba de fallos (modo privado, etc.)
+  get: k => { try { return localStorage.getItem(k); } catch (_) { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} },
+  del: k => { try { localStorage.removeItem(k); } catch (_) {} } };
+const doneSet = new Set(JSON.parse(ls.get('mpm_done') || '[]')); // archivos ya procesados (sobrevive a recargas)
+const keyOf = f => `${f.name}|${f.size}|${f.lastModified}`;
+
+/* ---------- Memoria: tamaño de lote seguro ----------
+   pdf-lib mantiene en RAM los PDFs de origen + el PDF final (+ una copia al descargar).
+   Pico real ≈ 2–3× el tamaño del lote. Por eso se sugiere un tamaño según el dispositivo. */
+const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const safeMB = Math.max(250, Math.min(2000, (navigator.deviceMemory || 4) * 1024 * (mobile ? .5 : 1) / 6));
+const SIZES = [250, 500, 1000, 1500, 2000];
+const sel = $('#max');
+sel.innerHTML = SIZES.map(v => `<option value="${v}">${v >= 1000 ? v / 1000 + ' GB' : v + ' MB'}</option>`).join('');
+const pick = mb => SIZES.filter(v => v <= mb).pop() || 250;
+sel.value = pick(safeMB);
+const limit = () => +sel.value * MB;
+
+/* Detección de cierre por falta de memoria: si al abrir queda la marca de "procesando", la pestaña murió. */
+const crashed = ls.get('mpm_run');
+if (crashed) {
+  ls.del('mpm_run');
+  try {
+    const r = JSON.parse(crashed), nuevo = pick(Math.min(+r.lim, r.mb) / 2);
+    sel.value = nuevo;
+    $('#crash').hidden = false;
+    $('#crash').innerHTML = `⚠️ La página se cerró al crear el lote ${r.n} (~${r.mb} MB), casi seguro por falta de memoria. Bajé el tamaño máximo a ${nuevo} MB. Vuelve a seleccionar los archivos: los lotes ya guardados aparecerán como procesados.`;
+  } catch (_) {}
 }
 
-/* qpdf lee los PDFs desde disco y escribe el resultado a disco: no carga los 2 GB en RAM. */
-function merge(id, count, name) {
-  const out = path.join(dir(id), 'out.pdf'), files = Array.from({ length: count }, (_, i) => path.join(dir(id), `${i}.pdf`));
-  const q = spawn('qpdf', ['--empty', '--pages', ...files, '--', out]); let err = '';
-  q.stderr.on('data', d => { err = (err + d).slice(-600); });
-  const fail = async msg => { await write(id, { ...(await read(id)), state: 'error', error: String(msg).split(dir(id) + path.sep).join('') }); }; // sin rutas internas
-  q.on('error', e => fail('no se pudo ejecutar qpdf: ' + e.message));
-  q.on('close', async code => {
-    try {
-      if (code !== 0 && code !== 3) return fail(err.trim() || `qpdf terminó con código ${code}`); // 3 = avisos, el archivo es válido
-      const size = (await fsp.stat(out)).size;
-      if (!size) return fail('el PDF generado está vacío');
-      await write(id, { ...(await read(id)), state: 'done', name, size });
-      files.forEach(f => fsp.unlink(f).catch(() => {})); // se borran los originales apenas hay resultado
-    } catch (e) { fail(e.message); }
+/* ---------- 1. Interpretar nombres ---------- */
+function parse(fn) {
+  let s = fn.replace(/\.pdf$/i, '').replace(/_/g, ' '), copy = false;
+  const c = s.match(/^(.*\S)\s+\((\d{1,2})\)\s*$/); // sufijo de copia "(1)"
+  if (c && /\d/.test(c[1])) { s = c[1]; copy = true; }
+  const bad = { name: '', copy, start: null };
+  let m = s.match(/(\d+(?:\.\d+)?)\s*[-–—~]\s*(\d+(?:\.\d+)?)/), a, b;
+  if (m) { a = +m[1]; b = +m[2]; }
+  else {
+    m = s.match(/(\d+(?:\.\d+)?)(?=\)?\s*$)/); // número simple al final
+    if (!m || /\b(especial|special|extra|omake|oneshot)\b/i.test(s)) return bad;
+    a = b = +m[1];
+  }
+  if (b < a) return bad;
+  const name = s.slice(0, m.index)
+    .replace(/\b(caps?|cap[ií]tulos?|chapters?|ch|vol(umen|umenes)?|tomo|c)\b\.?/gi, '')
+    .replace(/[()\[\]]/g, ' ').replace(/^[\s\-–—:]+|[\s\-–—:]+$/g, '').replace(/\s+/g, ' ');
+  return { name, copy, start: a, end: b };
+}
+
+function addFiles(list) {
+  for (const f of list) {
+    if (!/\.pdf$/i.test(f.name) && f.type !== 'application/pdf') continue;
+    if (S.items.some(i => keyOf(i.file) === keyOf(f))) continue;
+    const p = parse(f.name);
+    S.items.push({ file: f, size: f.size, ...p, parsed: p.start !== null, status: doneSet.has(keyOf(f)) ? 'done' : 'pending', keep: null, err: '' });
+  }
+  $('#app').hidden = !S.items.length;
+  render();
+}
+
+/* ---------- 2. Análisis ---------- */
+const active = i => i.parsed && !i.excluded && i.status !== 'error';
+function analyze() {
+  const it = S.items, lim = limit();
+  if (!S.manual) it.sort((x, y) => (x.parsed === y.parsed ? 0 : x.parsed ? -1 : 1) || x.start - y.start || x.end - y.end || x.file.name.localeCompare(y.file.name, undefined, { numeric: true }));
+  const cnt = {};
+  it.forEach(i => { if (i.name) { const k = i.name.toLowerCase(); (cnt[k] = cnt[k] || { n: 0, name: i.name }).n++; } });
+  const top = Object.values(cnt).sort((a, b) => b.n - a.n)[0];
+  S.manga = top ? top.name : 'Manga';
+
+  const groups = {}; S.warn = [];
+  it.forEach(i => { i.dupKey = null; i.excluded = false; if (i.parsed) (groups[rng(i.start, i.end)] ||= []).push(i); });
+  for (const [k, g] of Object.entries(groups)) {
+    if (g.length < 2) continue;
+    if (!g.some(i => i.keep)) { g.forEach(i => i.keep = false); [...g].sort((a, b) => a.copy - b.copy)[0].keep = true; }
+    g.forEach(i => { i.dupKey = k; i.excluded = !i.keep; });
+    S.warn.push(`⚠️ Posible duplicado: capítulos ${k} (${g.length} archivos). Elige cuál conservar.`);
+  }
+  it.filter(i => !i.parsed).forEach(i => S.warn.push(`⚠️ No se pudo determinar el rango de este archivo: ${i.file.name}`));
+  it.filter(i => i.size > lim && i.status !== 'done').forEach(i => S.warn.push(`⚠️ ${i.file.name} pesa ${fmt(i.size)} y supera el máximo: no se procesará como lote normal.`));
+  it.filter(i => i.status === 'error').forEach(i => S.warn.push(`❌ Error en ${i.file.name}: ${i.err}`));
+
+  S.missing = 0; let maxEnd = null;
+  [...it].filter(i => i.parsed && !i.excluded).sort((x, y) => x.start - y.start || x.end - y.end).forEach(i => {
+    if (maxEnd !== null && Math.ceil(i.start) - Math.floor(maxEnd) > 1) {
+      const a = Math.floor(maxEnd) + 1, b = Math.ceil(i.start) - 1; S.missing += b - a + 1;
+      S.warn.push(`⚠️ Posible capítulo faltante: ${rng(a, b)}.` + (it.some(x => !x.parsed) ? ' Podría estar en un archivo no reconocido.' : ''));
+    }
+    maxEnd = maxEnd === null ? i.end : Math.max(maxEnd, i.end);
   });
 }
 
-async function download(req, res, id) {
-  const j = await read(id);
-  if (j.state !== 'done') return json(res, 404, { error: 'todavía no está listo' });
-  const size = j.size, m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
-  let start = 0, end = size - 1, code = 200;
-  if (m && (m[1] || m[2])) {
-    if (m[1]) { start = +m[1]; if (m[2]) end = Math.min(+m[2], end); } else start = Math.max(0, size - +m[2]);
-    code = 206;
-    if (start > end) { res.writeHead(416, { 'content-range': `bytes */${size}` }); return res.end(); }
+/* ---------- 3. Lotes: en orden, sin pasar el máximo ---------- */
+function batches() {
+  const lim = limit(), out = []; let cur = null;
+  for (const f of S.items.filter(i => active(i) && i.status === 'pending' && i.size <= lim)) {
+    if (!cur || cur.size + f.size > lim) out.push(cur = { files: [], size: 0 });
+    cur.files.push(f); cur.size += f.size;
   }
-  const fn = (j.name || 'manga') + '.pdf';
-  const h = { 'content-type': 'application/pdf', 'content-length': end - start + 1, 'accept-ranges': 'bytes',
-    'content-disposition': `attachment; filename="${fn.replace(/[^\x20-\x7e]|["\\]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(fn).replace(/['()*]/g, c => '%' + c.charCodeAt(0).toString(16))}` };
-  if (code === 206) h['content-range'] = `bytes ${start}-${end}/${size}`;
-  res.writeHead(code, h);
-  if (req.method === 'HEAD') return res.end();
-  fs.createReadStream(path.join(dir(id), 'out.pdf'), { start, end }).on('error', () => res.destroy()).pipe(res);
+  out.forEach(b => { b.min = Math.min(...b.files.map(f => f.start)); b.max = Math.max(...b.files.map(f => f.end)); });
+  return out;
 }
 
-http.createServer(async (req, res) => {
-  res.setHeader('access-control-allow-origin', ORIGIN);
-  res.setHeader('access-control-allow-methods', 'GET,POST,PUT,HEAD,OPTIONS');
-  res.setHeader('access-control-allow-headers', 'content-type, range');
-  res.setHeader('access-control-expose-headers', 'content-length, content-range, accept-ranges');
-  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
-  const u = new URL(req.url, 'http://x'), p = u.pathname.split('/').filter(Boolean);
-  try {
-    if (!p.length) { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return fs.createReadStream(path.join(__dirname, 'public', 'index.html')).on('error', () => res.end('Manga PDF Manager')).pipe(res); }
-    if (p[0] === 'api' && p[1] === 'health') return json(res, 200, { ok: true, ttlHours: TTL / 36e5 });
-    if (p[0] === 'api' && p[1] === 'jobs' && !p[2] && req.method === 'POST') {
-      if ((await fsp.readdir(DATA)).length >= MAX_JOBS) return json(res, 429, { error: 'servidor ocupado, intenta más tarde' });
-      const id = crypto.randomBytes(16).toString('hex');
-      await fsp.mkdir(dir(id)); await write(id, { created: Date.now(), state: 'uploading' });
-      return json(res, 201, { id });
-    }
-    const id = p[0] === 'api' ? p[2] : p[0] === 'd' ? p[1] : null;
-    if (!id) return json(res, 404, { error: 'no encontrado' });
-    if (!/^[a-f0-9]{32}$/.test(id) || !fs.existsSync(jf(id))) return json(res, 404, { error: 'trabajo no encontrado o expirado' });
-    if (p[0] === 'd') return await download(req, res, id);
+/* ---------- 4. Pantalla ---------- */
+function render() {
+  analyze();
+  const it = S.items, sum = fn => it.filter(fn).reduce((n, i) => n + i.size, 0), bs = batches();
+  const ps = it.filter(i => i.parsed), errs = it.filter(i => i.status === 'error').length;
+  const st = [['📚 Manga', S.manga], ['📄 Archivos', it.length], ['📖 Capítulos', ps.length ? rng(Math.min(...ps.map(i => i.start)), Math.max(...ps.map(i => i.end))) : '—'],
+    ['💾 Tamaño total', fmt(sum(() => true))], ['✅ Procesados', fmt(sum(i => i.status === 'done'))], ['⏳ Pendientes', fmt(bs.reduce((n, b) => n + b.size, 0))],
+    ['⚠️ Advertencias', S.warn.length - errs], ['❌ Errores', errs], ['Faltantes', S.missing], ['Lotes pendientes', bs.length]];
+  $('#stats').innerHTML = st.map(([k, v]) => `<div><span>${k}</span><b>${esc(v)}</b></div>`).join('');
 
-    if (p[3] === undefined && req.method === 'GET') return json(res, 200, { ...(await read(id)), files: await uploaded(id) });
-    if (p[3] === 'files' && /^\d+$/.test(p[4]) && req.method === 'PUT') {
-      const expected = +u.searchParams.get('size'), have = await uploaded(id);
-      if (!expected || Object.values(have).reduce((a, b) => a + b, 0) + expected > MAX_JOB) return json(res, 413, { error: 'el lote supera el máximo permitido' });
-      const tmp = path.join(dir(id), `${p[4]}.part`);
-      try { await pipeline(req, fs.createWriteStream(tmp)); } catch (e) { await fsp.unlink(tmp).catch(() => {}); throw e; }
-      if ((await fsp.stat(tmp)).size !== expected) { await fsp.unlink(tmp); return json(res, 400, { error: 'subida incompleta' }); }
-      await fsp.rename(tmp, path.join(dir(id), `${p[4]}.pdf`));
-      return json(res, 200, { ok: true });
-    }
-    if (p[3] === 'merge' && req.method === 'POST') {
-      const { count, name } = JSON.parse(await body(req)), have = await uploaded(id), job = await read(id);
-      if (job.state === 'merging' || job.state === 'done') return json(res, 202, job);
-      for (let i = 0; i < count; i++) if (!have[i]) return json(res, 409, { error: `falta el archivo ${i}` });
-      await write(id, { ...job, state: 'merging', name: String(name || 'manga').slice(0, 150) });
-      merge(id, count, String(name || 'manga').slice(0, 150));
-      return json(res, 202, { state: 'merging' });
-    }
-    json(res, 404, { error: 'no encontrado' });
-  } catch (e) { if (!res.headersSent) json(res, 500, { error: e.message }); else res.destroy(); }
-}).listen(PORT, () => console.log('Manga PDF Manager en el puerto', PORT));
+  const ev = [...S.warn.map(t => ({ t })), ...S.events.map(e => ({ t: `${e.i} ${e.t}`, time: e.time }))];
+  $('#notes').innerHTML = ev.map(e => `<li class="${e.t.startsWith('❌') ? 'error' : e.t.startsWith('⚠️') ? 'warn' : 'done'}"><span class="info">${esc(e.t)}</span><small>${e.time || ''}</small></li>`).join('') || '<li>Sin notificaciones.</li>';
 
-/* Limpieza automática: borra trabajos más viejos que TTL_HOURS */
-setInterval(async () => {
-  for (const id of await fsp.readdir(DATA).catch(() => [])) {
-    const st = await fsp.stat(dir(id)).catch(() => null);
-    const created = await read(id).then(j => j.created, () => st && st.mtimeMs);
-    if (st && Date.now() - created > TTL) fsp.rm(dir(id), { recursive: true, force: true });
+  $('#batches').innerHTML = S.doneBatches.map(d => `<li class="done"><span class="info"><b>✅ ${esc(d.name)}</b><small>Capítulos ${d.r} · ${fmt(d.size)}${d.url ? ' · enlace válido hasta ' + new Date(d.exp).toLocaleString() : ''}</small></span>${d.url ? `<span><a href="${esc(d.url)}" target="_blank" rel="noopener"><button>⬇️ Descargar</button></a> <button data-copy="${esc(d.url)}">Copiar enlace</button></span>` : ''}</li>`).join('') +
+    bs.map((b, n) => `<li class="pending"><span class="info"><b>⏳ Lote ${n + 1}</b><small>Capítulos ${rng(b.min, b.max)} · ${fmt(b.size)} · ${b.files.length} archivos</small></span></li>`).join('') || '<li>No hay lotes pendientes.</li>';
+
+  $('#files').innerHTML = it.map((i, n) => {
+    const big = i.size > limit() && i.status !== 'done';
+    const cls = i.status === 'done' ? 'done' : i.status === 'error' ? 'error' : (!i.parsed || i.dupKey || big) ? 'warn' : 'pending';
+    const tx = i.status === 'done' ? 'Procesado' : i.status === 'error' ? 'Error: ' + i.err : !i.parsed ? 'Rango no reconocido' : i.excluded ? 'Duplicado omitido' : i.dupKey ? 'Duplicado (conservado)' : big ? 'Demasiado grande' : 'Pendiente';
+    return `<li data-n="${n}" class="${cls} ${i.excluded ? 'off' : ''}"><span class="info"><b>${{ done: '✅', error: '❌', warn: '⚠️', pending: '⏳' }[cls]} ${esc(i.file.name)}</b><small>${fmt(i.size)} · Cap. ${i.parsed ? rng(i.start, i.end) : '?'} · ${esc(tx)}</small></span>
+      <span>${!i.parsed ? `<button data-a="set">Asignar capítulos</button> ` : ''}${i.dupKey && !i.keep ? `<button data-a="keep">Conservar este</button> ` : ''}<button data-a="rm" aria-label="Quitar">✕</button></span></li>`;
+  }).join('');
+
+  $('#memHint').innerHTML = (+sel.value > safeMB ? '⚠️ ' : '💡 ') + `Tamaño seguro estimado para este equipo: ~${Math.round(safeMB)} MB. Armar un PDF consume 2–3 veces su peso en memoria` + (+sel.value > safeMB ? '; con este valor la pestaña podría cerrarse.' : '.');
+  const host = SERVER ? new URL(SERVER).host : location.host;
+  $('#priv').textContent = !remoteMode() ? '🔒 100% local: tus PDFs nunca salen de este dispositivo'
+    : $('#mode').value === 'server' ? `☁️ Tus PDFs se suben temporalmente a ${host} y se borran en ~${TTL} h`
+    : `☁️ Lotes grandes: se suben temporalmente a ${host} (se borran en ~${TTL} h). Lotes pequeños: 100% locales.`;
+  if (remoteMode()) $('#memHint').textContent = '☁️ Los lotes que se procesan en el servidor no dependen de la memoria de tu teléfono; los locales sí (tamaño seguro ~' + Math.round(safeMB) + ' MB).';
+  $('#auto').hidden = !S.manual;
+  $('#go').disabled = S.running || !bs.length;
+}
+const note = (i, t) => { S.events.unshift({ i, t, time: new Date().toLocaleTimeString() }); render(); };
+
+/* ---------- 5. Nombre y guardado ---------- */
+function askName(def, size) {
+  return new Promise(res => {
+    const d = $('#dlg'); $('#nm').value = def; $('#dinfo').textContent = `Tamaño: ${fmt(size)}. Edita el nombre si quieres.`;
+    const done = v => { d.close(); res(v); };
+    $('#dl').onclick = () => done(($('#nm').value.trim() || def).replace(/[\\/:*?"<>|]/g, '').replace(/\.pdf$/i, ''));
+    $('#skip').onclick = () => done(null);
+    d.oncancel = e => e.preventDefault();
+    d.showModal();
+  });
+}
+/* Devuelve true si se guardó, false si el usuario canceló. Se llama justo tras el clic (necesita gesto del usuario). */
+async function saveFile(bytes, name) {
+  const fileName = name + '.pdf';
+  // 1) Chrome/Edge de escritorio: escribe directo a disco por trozos, sin crear un Blob (no duplica la RAM)
+  if (window.showSaveFilePicker) {
+    try {
+      const h = await showSaveFilePicker({ suggestedName: fileName, types: [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }] });
+      const w = await h.createWritable();
+      for (let o = 0; o < bytes.length; o += 32 * MB) await w.write(bytes.subarray(o, o + 32 * MB));
+      await w.close(); return true;
+    } catch (e) { if (e.name === 'AbortError') return false; console.warn(e); }
   }
-}, 10 * 60 * 1000).unref();
+  // 2) Resto de navegadores: Blob. En iPhone/iPad se usa Compartir → Guardar en Archivos.
+  const blob = new Blob([bytes], { type: 'application/pdf' });
+  const file = new File([blob], fileName, { type: 'application/pdf' });
+  if (/iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file] }); return true; } catch (e) { if (e.name === 'AbortError') return false; }
+    }
+  }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName;
+  document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 300000);
+  return true;
+}
+
+/* ---------- 6. Procesar lotes (uno a uno, liberando memoria) ---------- */
+async function run() {
+  if (S.running) return;
+  if (typeof PDFLib === 'undefined' && !SERVER_OK) return note('❌', 'No se cargó la librería pdf-lib (¿sin internet?). Recarga la página.');
+  const bs = batches(); if (!bs.length) return;
+  S.running = true; render(); $('#prog').hidden = false;
+  let wl = null, aborted = false;
+  try { wl = await navigator.wakeLock?.request('screen'); } catch (_) {} // evita que el móvil se duerma
+  for (let n = 0; n < bs.length && !aborted; n++) {
+    const b = bs[n]; let cur = null;
+    try {
+      if (useRemote(b)) { if (await remoteBatch(b, n, bs.length) === 'abort') aborted = true; continue; }
+      ls.set('mpm_run', JSON.stringify({ n: n + 1, mb: Math.round(b.size / MB), lim: +sel.value })); // marca anti-cierre
+      let out = await PDFLib.PDFDocument.create(), read = 0;
+      for (const f of b.files) {
+        cur = f; const pct = Math.round(read / b.size * 100);
+        $('#prog').innerHTML = `<h2>Procesando lote ${n + 1} de ${bs.length}</h2><div>${esc(S.manga)} ${rng(b.min, b.max)}</div><div class="bar"><i style="width:${pct}%"></i></div><small class="hint">${pct}% · ${esc(f.file.name)}</small>`;
+        await tick();
+        let buf = await f.file.arrayBuffer(), src = await PDFLib.PDFDocument.load(buf, { ignoreEncryption: true, updateMetadata: false });
+        (await out.copyPages(src, src.getPageIndices())).forEach(p => out.addPage(p));
+        buf = src = null; read += f.size; // se suelta la referencia del origen
+      }
+      cur = null;
+      $('#prog').innerHTML = `<h2>Lote ${n + 1} de ${bs.length}: guardando…</h2><div class="bar"><i style="width:100%"></i></div>`;
+      await tick();
+      let bytes = await out.save({ addDefaultPage: false }); out = null; // el documento se suelta antes de pedir el nombre
+      if (!bytes.length) throw new Error('el PDF generado está vacío');
+      const size = bytes.length, name = await askName(`(${b.min} - ${b.max}) ${S.manga}`, size);
+      const ok = name ? await saveFile(bytes, name) : false;
+      bytes = null;
+      if (!name) note('⚠️', `Lote ${n + 1} omitido: sigue pendiente.`);
+      else if (!ok) { aborted = true; note('⚠️', 'Descarga cancelada: el lote sigue pendiente.'); }
+      else {
+        b.files.forEach(f => { f.status = 'done'; doneSet.add(keyOf(f.file)); });
+        ls.set('mpm_done', JSON.stringify([...doneSet]));
+        S.doneBatches.push({ name: name + '.pdf', r: rng(b.min, b.max), size });
+        note('🔔', `Lote terminado: se creó correctamente ${name}.pdf`);
+      }
+    } catch (e) {
+      if (cur) { cur.status = 'error'; cur.err = e.message || 'no se pudo leer'; }
+      note('❌', `Lote ${n + 1} falló${cur ? ' en ' + cur.file.name : ''}: ${e.message}`);
+    } finally { ls.del('mpm_run'); }
+  }
+  S.running = false; $('#prog').hidden = true;
+  if (wl) wl.release().catch(() => {});
+  if (!aborted) note('🔔', 'Proceso terminado: todos los archivos compatibles fueron procesados.');
+}
+
+/* ---------- 7. Modo servidor (qpdf): para lotes que no caben en la RAM del teléfono ----------
+   Flujo: subir cada PDF (archivo a archivo, con reintentos) → el servidor une con qpdf desde disco → enlace de descarga.
+   Un archivo solo se marca "procesado" cuando el servidor confirma que el resultado existe. */
+let SERVER = '';          // '' = el servidor sirve esta página; 'https://mi-servidor.com' si la página está en otro sitio; null = sin servidor
+let SERVER_OK = false, TTL = 6;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const remoteMode = () => SERVER_OK && $('#mode').value !== 'local';
+const useRemote = b => SERVER_OK && ($('#mode').value === 'server' || ($('#mode').value === 'auto' && b.size > Math.min(safeMB, 500) * MB));
+S.doneBatches = JSON.parse(ls.get('mpm_links') || '[]').filter(d => d.exp > Date.now());
+async function probe() {
+  if (SERVER === null) return;
+  try {
+    const j = await (await fetch(SERVER + '/api/health', { cache: 'no-store' })).json();
+    if (j.ok) { SERVER_OK = true; TTL = j.ttlHours; $('#modeL').hidden = false; render(); }
+  } catch (_) { /* sin servidor: la app sigue 100% local */ }
+}
+async function api(path, opt) {
+  const r = await fetch(SERVER + path, opt), t = await r.text();
+  let j = {}; try { j = JSON.parse(t); } catch (_) {}
+  if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+function put(url, file, onp) { // XHR: da progreso real y Safari envía el File desde disco sin cargarlo en RAM
+  return new Promise((ok, ko) => {
+    const x = new XMLHttpRequest(); x.open('PUT', url);
+    x.upload.onprogress = e => onp(e.loaded);
+    x.onload = () => x.status < 300 ? ok() : ko(new Error((JSON.parse(x.responseText || '{}').error) || 'HTTP ' + x.status));
+    x.onerror = x.ontimeout = () => ko(new Error('sin conexión'));
+    x.send(file);
+  });
+}
+async function putRetry(url, file, onp) {
+  for (let t = 0; ; t++) {
+    try { return await put(url, file, onp); }
+    catch (e) {
+      if (t >= 4 || /superas|HTTP 4/.test(e.message)) throw e;
+      note('⚠️', `Reintentando ${file.name}: ${e.message}`);
+      if (!navigator.onLine) await new Promise(r => addEventListener('online', r, { once: true })); else await sleep(2000 * (t + 1));
+    }
+  }
+}
+const sig = b => { let h = 5381; for (const f of b.files) for (const c of keyOf(f.file)) h = ((h * 33) ^ c.charCodeAt(0)) >>> 0; return h.toString(36) + b.files.length; };
+async function remoteBatch(b, n, total) {
+  const show = (t, pct) => $('#prog').innerHTML = `<h2>Lote ${n + 1} de ${total} · servidor</h2><div>${esc(t)}</div><div class="bar"><i style="width:${pct}%"></i></div>`;
+  const map = JSON.parse(ls.get('mpm_jobs') || '{}'), sg = sig(b); let id = map[sg], st = null;
+  if (id) { try { st = await api(`/api/jobs/${id}`); } catch (_) { id = null; } } // ¿el trabajo anterior sigue vivo? → reanuda
+  if (!id) { id = (await api('/api/jobs', { method: 'POST' })).id; map[sg] = id; ls.set('mpm_jobs', JSON.stringify(map)); st = { state: 'uploading', files: {} }; }
+  let name = st.name;
+  try {
+    if (st.state === 'error') { id = (await api('/api/jobs', { method: 'POST' })).id; map[sg] = id; ls.set('mpm_jobs', JSON.stringify(map)); st = { state: 'uploading', files: {} }; }
+    if (st.state !== 'done') {
+      let sent = 0;
+      if (st.state === 'uploading') for (let i = 0; i < b.files.length; i++) {
+        const f = b.files[i], base = sent;
+        if (st.files[i] !== f.size) {
+          show(`Subiendo ${f.file.name} (${i + 1}/${b.files.length})`, Math.round(base / b.size * 100));
+          await putRetry(`${SERVER}/api/jobs/${id}/files/${i}?size=${f.size}`, f.file, l => show(`Subiendo ${f.file.name} (${i + 1}/${b.files.length})`, Math.round((base + l) / b.size * 100)));
+        }
+        sent += f.size;
+      }
+      if (st.state === 'uploading') {
+        name = await askName(`(${b.min} - ${b.max}) ${S.manga}`, b.size);
+        if (!name) { note('⚠️', `Lote ${n + 1} omitido: sigue pendiente.`); return 'skip'; }
+        await api(`/api/jobs/${id}/merge`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ count: b.files.length, name }) });
+      }
+      for (let k = 0; ; k++) { // espera a que el servidor termine de unir
+        show('Uniendo PDFs en el servidor…' + '.'.repeat(k % 4), 100); await sleep(2500);
+        st = await api(`/api/jobs/${id}`);
+        if (st.state === 'done') break;
+        if (st.state === 'error') throw new Error(st.error);
+      }
+    }
+  } catch (e) {
+    const msg = e.message.replace(/\b(\d+)\.pdf/g, (m, i) => (b.files[+i] ? b.files[+i].file.name : m)); // qpdf nombra los archivos por índice
+    throw new Error(msg);
+  }
+  const url = `${SERVER}/d/${id}`, h = await fetch(url, { method: 'HEAD' }); // confirmar que el resultado existe de verdad
+  if (!h.ok || +h.headers.get('content-length') !== st.size) throw new Error('el servidor no pudo confirmar el archivo final');
+  b.files.forEach(f => { f.status = 'done'; doneSet.add(keyOf(f.file)); });
+  ls.set('mpm_done', JSON.stringify([...doneSet]));
+  S.doneBatches.push({ name: st.name + '.pdf', r: rng(b.min, b.max), size: st.size, url: new URL(url, location.href).href, exp: Date.now() + TTL * 36e5 });
+  ls.set('mpm_links', JSON.stringify(S.doneBatches.filter(d => d.url)));
+  delete map[sg]; ls.set('mpm_jobs', JSON.stringify(map));
+  note('🔔', `Lote listo en el servidor: ${st.name}.pdf. Descárgalo desde "Lotes" (válido ~${TTL} h).`);
+}
+
+/* ---------- 8. Eventos ---------- */
+$('#file').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
+const drop = $('#drop');
+['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
+sel.onchange = render;
+$('#go').onclick = run;
+$('#mode').onchange = render;
+$('#batches').onclick = e => { const u = e.target.dataset.copy; if (u) navigator.clipboard.writeText(u).then(() => note('🔔', 'Enlace copiado'), () => prompt('Copia el enlace:', u)); };
+$('#auto').onclick = () => { S.manual = false; render(); };
+$('#clear').onclick = () => {
+  if (S.running || !confirm('¿Limpiar la lista y olvidar los archivos ya procesados?')) return;
+  Object.assign(S, { items: [], events: [], doneBatches: [], manual: false }); doneSet.clear(); ls.del('mpm_done');
+  $('#app').hidden = true; render();
+};
+$('#files').onclick = e => {
+  const b = e.target.closest('button'); if (!b || S.running) return;
+  const n = +b.closest('li').dataset.n, i = S.items[n];
+  if (b.dataset.a === 'rm') S.items.splice(n, 1);
+  if (b.dataset.a === 'keep') S.items.filter(x => x.dupKey === i.dupKey).forEach(x => x.keep = x === i);
+  if (b.dataset.a === 'set') {
+    const m = (prompt(`Capítulos de "${i.file.name}" (ej: 12 o 12-20):`) || '').match(/^\s*(\d+(?:\.\d+)?)\s*(?:[-–]\s*(\d+(?:\.\d+)?))?\s*$/);
+    if (m && (!m[2] || +m[2] >= +m[1])) { i.start = +m[1]; i.end = +(m[2] || m[1]); i.parsed = true; }
+  }
+  $('#app').hidden = !S.items.length; render();
+};
+// Reordenar: arrastre inmediato con ratón; en pantalla táctil, mantener presionado 250 ms
+if (window.Sortable) new Sortable($('#files'), {
+  animation: 150, delay: 250, delayOnTouchOnly: true, touchStartThreshold: 6, filter: 'button', preventOnFilter: false,
+  onEnd() { if (S.running) return render(); S.items = [...$('#files').children].map(li => S.items[+li.dataset.n]); S.manual = true; render(); }
+});
+// Errores inesperados visibles en Notificaciones (en vez de fallar en silencio)
+addEventListener('error', e => note('❌', `Error de JavaScript: ${e.message}`));
+addEventListener('unhandledrejection', e => note('❌', `Error: ${(e.reason && e.reason.message) || e.reason}`));
+render(); probe();
+</script>
+</body>
+</html>
